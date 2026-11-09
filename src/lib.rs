@@ -910,9 +910,8 @@ impl<'a> Bencher<'a> {
     /// `value` causes [`Suite::run_to`] to return [`io::ErrorKind::InvalidInput`].
     pub fn report_metric(&mut self, value: f64, unit: &str) {
         if let Err(msg) = validate_metric(unit, value) {
-            if self.start_instant.is_some() {
-                self.remaining = 0;
-            }
+            self.started = true;
+            self.remaining = 0;
             if self.profiler_err.is_none() {
                 self.profiler_err = Some(io::Error::new(
                     io::ErrorKind::InvalidInput,
