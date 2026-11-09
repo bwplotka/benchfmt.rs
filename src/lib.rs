@@ -929,8 +929,8 @@ impl<'a> Bencher<'a> {
         });
     }
 
-    /// Resets the elapsed timer and allocation baseline before the benchmark loop starts,
-    /// excluding any prior one-time setup work.
+    /// Resets the elapsed timer, allocation baseline, and any previously reported metrics
+    /// before the benchmark loop starts, excluding any prior one-time setup work.
     ///
     /// Calling `reset_timer` inside an active [`Bencher::keep_running`] loop is unsupported
     /// (matching Go 1.24's `b.Loop()`) and causes [`Suite::run_to`] to return
@@ -960,6 +960,7 @@ impl<'a> Bencher<'a> {
         }
         self.elapsed = Duration::ZERO;
         self.fallback_start = Instant::now();
+        self.extra_metrics.clear();
     }
 
     /// Go 1.24 `b.Loop()` equivalent: starts timing and allocation tracking on the first call,
