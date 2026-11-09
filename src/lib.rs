@@ -310,7 +310,7 @@ fn validate_metric(unit: &str, value: f64) -> Result<(), String> {
             "built-in benchmark metric {unit:?} must be >= 0, got {value}"
         ));
     }
-    if matches!(unit, "B/op" | "allocs/op") && value > u64::MAX as f64 {
+    if matches!(unit, "B/op" | "allocs/op") && value >= u64::MAX as f64 {
         return Err(format!(
             "built-in benchmark metric {unit:?} exceeds u64::MAX, got {value}"
         ));
