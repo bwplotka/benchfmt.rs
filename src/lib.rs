@@ -1648,7 +1648,9 @@ mod tests {
             (12.346, "        12.35 ns/op"),
             (1.2346, "         1.235 ns/op"),
             (0.12346, "         0.1235 ns/op"),
+            (0.012346, "         0.01235 ns/op"),
             (0.0012346, "         0.001235 ns/op"),
+            (0.00012346, "         0.0001235 ns/op"),
         ];
         for (ns_per_op, expected) in cases {
             let mut buf = Vec::new();
@@ -2104,6 +2106,9 @@ mod tests {
             })
             .bench("BuiltinOverrides", |b| {
                 b.set_bytes(1024);
+                // Any metric reported during pre-loop setup is cleared by `reset_timer()`.
+                b.report_metric(777.0, "stale-setup/op");
+                b.reset_timer();
                 b.iter(|| 1);
                 // Override built-in `ns/op` (suppressing it with `0.0`), `MB/s` (suppressing with
                 // `0.0`), `B/op`, and `allocs/op`, while reporting a custom unit.
@@ -2113,6 +2118,12 @@ mod tests {
                 b.report_metric(4.0, "allocs/op");
                 b.report_metric(-0.0, "z-custom/op");
                 b.report_metric(12.346, "a-custom/op");
+            })
+            .bench("NonZeroBuiltinOverrides", |b| {
+                b.iter(|| 1);
+                b.report_metric(42.5, "ns/op");
+                b.report_metric(123.45, "MB/s");
+                b.report_metric(-12.346, "delta/op");
             })
             .run_to(&mut out)
             .unwrap();
@@ -2127,16 +2138,48 @@ mod tests {
             "{text}"
         );
         // Built-in `ns/op` and `MB/s` were suppressed with `0.0`, `B/op` and `allocs/op` were
-        // overridden, and `-0.0` was normalized to `0`.
+        // overridden, `-0.0` was normalized to `0`, and `stale-setup/op` was cleared by
+        // `reset_timer()`.
+        assert!(!text.contains("stale-setup/op"), "{text}");
         assert!(
             text.contains(
                 "BenchmarkBuiltinOverrides-2\t      10\t     512 B/op\t       4 allocs/op\t        12.35 a-custom/op\t         0 z-custom/op\n"
             ),
             "{text}"
         );
+        assert!(
+            text.contains(
+                "BenchmarkNonZeroBuiltinOverrides-2\t      10\t        42.50 ns/op\t  123.45 MB/s\t       0 B/op\t       0 allocs/op\t       -12.35 delta/op\n"
+            ),
+            "{text}"
+        );
+
+        // Direct `BenchRecord::write` deduplicates custom units (last write wins) and suppresses
+        // an active `mb_per_sec: Some(...)` when overridden with `("MB/s", 0.0)`.
+        let mut rec_buf = Vec::new();
+        BenchRecord {
+            name: "DirectRecord",
+            cpu_procs: Some(1),
+            iterations: 5,
+            ns_per_op: 100.0,
+            mb_per_sec: Some(999.0),
+            alloc_bytes_per_op: None,
+            allocs_per_op: None,
+            extra_metrics: vec![
+                ("MB/s".to_owned(), 0.0),
+                ("dup/op".to_owned(), 1.0),
+                ("dup/op".to_owned(), 2.5),
+            ],
+        }
+        .write(&mut rec_buf)
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(rec_buf).unwrap(),
+            "BenchmarkDirectRecord\t       5\t       100.0 ns/op\t         2.500 dup/op\n"
+        );
 
         // Invalid units (empty, whitespace, control characters) and invalid values (`NaN`, `inf`,
-        // negative built-in overrides) fail with `InvalidInput`.
+        // negative or `>= u64::MAX as f64` built-in overrides) fail immediately with `InvalidInput`.
         for (unit, val) in [
             ("", 1.0),
             ("wire B/op", 1.0),
@@ -2144,11 +2187,15 @@ mod tests {
             ("wire\nB/op", 1.0),
             ("wire-B/op", f64::NAN),
             ("wire-B/op", f64::INFINITY),
+            ("wire-B/op", f64::NEG_INFINITY),
             ("ns/op", -1.0),
             ("MB/s", -1.0),
             ("B/op", -1.0),
             ("allocs/op", -1.0),
+            ("B/op", u64::MAX as f64),
+            ("allocs/op", u64::MAX as f64),
         ] {
+            let mut in_loop_iters = 0usize;
             let err = Suite::with_config(
                 "pkg",
                 BenchConfig {
@@ -2158,6 +2205,7 @@ mod tests {
             )
             .bench("InvalidMetric", |b| {
                 while b.keep_running() {
+                    in_loop_iters += 1;
                     b.report_metric(val, unit);
                 }
             })
@@ -2167,6 +2215,32 @@ mod tests {
                 err.kind(),
                 io::ErrorKind::InvalidInput,
                 "expected InvalidInput for ({unit:?}, {val})"
+            );
+            assert_eq!(
+                in_loop_iters, 1,
+                "expected in-loop invalid report_metric to abort after 1 iteration for ({unit:?}, {val})"
+            );
+
+            let mut pre_loop_iters = 0usize;
+            let pre_err = Suite::with_config(
+                "pkg",
+                BenchConfig {
+                    benchtime: BenchTime::Iterations(5),
+                    ..BenchConfig::default()
+                },
+            )
+            .bench("InvalidPreLoopMetric", |b| {
+                b.report_metric(val, unit);
+                while b.keep_running() {
+                    pre_loop_iters += 1;
+                }
+            })
+            .run_to(Vec::new())
+            .unwrap_err();
+            assert_eq!(pre_err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                pre_loop_iters, 0,
+                "expected pre-loop invalid report_metric to skip keep_running() for ({unit:?}, {val})"
             );
         }
 
