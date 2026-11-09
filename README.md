@@ -30,6 +30,7 @@ Comparing Rust changes across commits or benchmarking Rust implementations side 
 | Sampling model | `-count` independent calibrated epochs for fixed `-benchtime`, e.g. `6 x 2s` | 100 linear-ramp samples bucketed into `--epochs`, `6` by default | 100 linear-ramp or flat samples |
 | Fit for `benchstat` Mann-Whitney U | Exact, each epoch is an independent steady-state run | Approximate, early buckets average shorter cold runs and later buckets average longer warm runs | N/A, uses Criterion's own t-test and bootstrap |
 | Heap allocations | `B/op` and `allocs/op` via `CountingAlloc` or `ProcessAlloc` | Not recorded | Not recorded |
+| Custom metrics | `b.report_metric(value, "unit")` (e.g. `wire-B/op`, `items/s`), plus built-in metric overrides | Not recorded | Single `Measurement` trait per group |
 | Profiling | Optional `-cpuprofile` and `-memprofile` pprof flags plus `Profiler` trait | None | External `pprof` or custom `Profiler` adapter |
 | Throughput unit | Decimal `MB/s` at `1e6` bytes/s, matching Go `testing.B` | Converts `Throughput::Bytes` to decimal `MB/s` | Decimal `MB/s` or binary `MiB/s` |
 | Multi-run comparison | `benchstat -col /dim` across arbitrary files, commits, and Go vs. Rust | `benchstat -col /dim` via `full_id` | Pairwise `base` vs. `new` directory |
@@ -79,6 +80,7 @@ fn main() {
             while b.keep_running() {
                 black_box(data.len());
             }
+            b.report_metric(data.len() as f64, "wire-B/op");
         })
         .run();
 }
@@ -127,7 +129,8 @@ go tool pprof -http=:8080 mem.pb.gz
 - `-bench` strips leading `^`, trailing `$`, and `Benchmark`, then matches names with `str::contains` or exact equality under `--exact`, rather than full regular expressions. `--skip` excludes matching substrings.
 - `-cpu N` sets the `-N` suffix on `BenchmarkFoo-N` lines rather than sweeping a comma-separated thread list or tuning a runtime scheduler.
 - `CountingAlloc` tracks `B/op` and `allocs/op` on the calling thread without atomic contention, while `ProcessAlloc` aggregates `B/op` and `allocs/op` across all threads for multi-threaded benchmarks; `-memprofile` samples heap allocations across active threads during `keep_running()` with either allocator.
-- Benchmarks register flat names on `Suite::bench` such as `"Decode/case=1kb"` rather than nesting `b.Run` sub-closures, and `Bencher` exposes `reset_timer()` for one-time setup before the loop rather than per-iteration `StopTimer` / `StartTimer` or custom `ReportMetric` units.
+- Benchmarks register flat names on `Suite::bench` such as `"Decode/case=1kb"` rather than nesting `b.Run` sub-closures, and `Bencher` exposes `reset_timer()` for one-time setup before the loop rather than per-iteration `StopTimer` / `StartTimer`.
+- `Bencher::report_metric(value, unit)` mirrors Go's `b.ReportMetric`: custom units are sorted alphabetically, reporting the same unit overwrites the previous value, reporting `"ns/op"`, `"MB/s"`, `"B/op"`, or `"allocs/op"` overrides the built-in metric, and setting `"ns/op"` or `"MB/s"` to `0.0` suppresses it.
 
 ### License
 

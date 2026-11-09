@@ -22,10 +22,40 @@ use std::sync::atomic::{AtomicU64, Ordering};
 thread_local! {
     // `const` initialization guarantees TLS access never triggers a recursive heap allocation.
     static THREAD_ALLOC_COUNTS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    static THREAD_ALLOC_PAUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[inline]
+fn is_alloc_tracking_paused() -> bool {
+    THREAD_ALLOC_PAUSED.try_with(Cell::get).unwrap_or(false)
+}
+
+/// Runs `f` while pausing [`CountingAlloc`], [`ProcessAlloc`], and `-memprofile` sampling on the
+/// calling thread so internal harness bookkeeping (such as [`crate::Bencher::report_metric`])
+/// never skews `B/op` or `allocs/op`.
+pub(crate) fn without_alloc_tracking<R>(f: impl FnOnce() -> R) -> R {
+    struct PauseGuard(bool);
+    impl Drop for PauseGuard {
+        fn drop(&mut self) {
+            let _ = THREAD_ALLOC_PAUSED.try_with(|c| c.set(self.0));
+        }
+    }
+    let prev = THREAD_ALLOC_PAUSED
+        .try_with(|c| {
+            let old = c.get();
+            c.set(true);
+            old
+        })
+        .unwrap_or(false);
+    let _guard = PauseGuard(prev);
+    f()
 }
 
 #[inline]
 fn record_thread_alloc(bytes: usize) {
+    if is_alloc_tracking_paused() {
+        return;
+    }
     #[cfg(feature = "pprof")]
     if crate::pprof_support::is_in_heap_sample() {
         return;
@@ -201,6 +231,9 @@ impl<A> ProcessAlloc<A> {
 
     #[inline]
     fn record_alloc(&self, bytes: usize) {
+        if is_alloc_tracking_paused() {
+            return;
+        }
         #[cfg(feature = "pprof")]
         if crate::pprof_support::is_in_heap_sample() {
             return;
