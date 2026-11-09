@@ -16,7 +16,8 @@
 //!
 //! Designed for apples-to-apples performance regression testing (`benchstat old.txt new.txt`)
 //! and cross-language Go vs. Rust benchmark comparisons on the same machine, reporting
-//! `ns/op`, decimal `MB/s`, `B/op`, and `allocs/op`.
+//! `ns/op`, decimal `MB/s`, `B/op`, `allocs/op`, and custom metrics via
+//! [`Bencher::report_metric`].
 //!
 //! # Example (`harness = false` benchmark binary)
 //!
@@ -289,8 +290,60 @@ fn detect_cpu_model() -> Option<String> {
     None
 }
 
+/// Validates a `(unit, value)` pair reported via [`Bencher::report_metric`] or [`BenchRecord`].
+fn validate_metric(unit: &str, value: f64) -> Result<(), String> {
+    if unit.is_empty() {
+        return Err("benchmark metric unit must not be empty".to_owned());
+    }
+    if unit.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "benchmark metric unit {unit:?} must not contain whitespace or control characters"
+        ));
+    }
+    if !value.is_finite() {
+        return Err(format!(
+            "benchmark metric value for {unit:?} must be finite, got {value}"
+        ));
+    }
+    if matches!(unit, "ns/op" | "MB/s" | "B/op" | "allocs/op") && value < 0.0 {
+        return Err(format!(
+            "built-in benchmark metric {unit:?} must be >= 0, got {value}"
+        ));
+    }
+    if matches!(unit, "B/op" | "allocs/op") && value > u64::MAX as f64 {
+        return Err(format!(
+            "built-in benchmark metric {unit:?} exceeds u64::MAX, got {value}"
+        ));
+    }
+    Ok(())
+}
+
+/// Formats a `(value, unit)` pair using Go `testing/benchmark.go`'s `prettyPrint` widths and
+/// 4-significant-digit thresholds.
+fn write_pretty_metric(mut out: impl Write, x: f64, unit: &str) -> io::Result<()> {
+    let x = if x == 0.0 { 0.0 } else { x };
+    let y = x.abs();
+    if y == 0.0 || y >= 999.95 {
+        write!(out, "{x:10.0} {unit}")
+    } else if y >= 99.995 {
+        write!(out, "{x:12.1} {unit}")
+    } else if y >= 9.9995 {
+        write!(out, "{x:13.2} {unit}")
+    } else if y >= 0.99995 {
+        write!(out, "{x:14.3} {unit}")
+    } else if y >= 0.099995 {
+        write!(out, "{x:15.4} {unit}")
+    } else if y >= 0.0099995 {
+        write!(out, "{x:16.5} {unit}")
+    } else if y >= 0.00099995 {
+        write!(out, "{x:17.6} {unit}")
+    } else {
+        write!(out, "{x:18.7} {unit}")
+    }
+}
+
 /// Single formatted `Benchmark...` result line matching Go's `testing.BenchmarkResult`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BenchRecord<'a> {
     /// Benchmark name without the leading `Benchmark` prefix (added automatically if absent).
     pub name: &'a str,
@@ -306,6 +359,8 @@ pub struct BenchRecord<'a> {
     pub alloc_bytes_per_op: Option<u64>,
     /// Optional heap allocations per operation (`allocs/op`).
     pub allocs_per_op: Option<u64>,
+    /// Additional user-reported `(unit, value)` metrics from [`Bencher::report_metric`].
+    pub extra_metrics: Vec<(String, f64)>,
 }
 
 impl BenchRecord<'_> {
@@ -326,44 +381,81 @@ impl BenchRecord<'_> {
                 ),
             ));
         }
+
+        let mut ns_override: Option<f64> = None;
+        let mut mbps_override: Option<f64> = None;
+        let mut bytes_override: Option<u64> = None;
+        let mut allocs_override: Option<u64> = None;
+        let mut custom: Vec<(&str, f64)> = Vec::new();
+
+        for (unit, value) in &self.extra_metrics {
+            validate_metric(unit, *value)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            match unit.as_str() {
+                "ns/op" => ns_override = Some(*value),
+                "MB/s" => mbps_override = Some(*value),
+                "B/op" => bytes_override = Some(*value as u64),
+                "allocs/op" => allocs_override = Some(*value as u64),
+                other => {
+                    if let Some((_, existing)) = custom.iter_mut().find(|(u, _)| *u == other) {
+                        *existing = *value;
+                    } else {
+                        custom.push((other, *value));
+                    }
+                }
+            }
+        }
+        custom.sort_unstable_by_key(|(a, _)| *a);
+
+        // Match Go's `BenchmarkResult.String`: setting `"ns/op"` to `0.0` via `report_metric`
+        // suppresses the built-in `ns/op` column, but a valid `benchfmt` record must still emit at
+        // least one `<value> <unit>` pair.
+        let emit_ns = match ns_override {
+            Some(0.0) => None,
+            Some(v) => Some(v),
+            None => Some(self.ns_per_op),
+        };
+        let emit_mbps = mbps_override
+            .or(self.mb_per_sec)
+            .filter(|&v| v.is_finite() && v > 0.0);
+        let emit_bytes = bytes_override.or(self.alloc_bytes_per_op);
+        let emit_allocs = allocs_override.or(self.allocs_per_op);
+
+        if emit_ns.is_none()
+            && emit_mbps.is_none()
+            && emit_bytes.is_none()
+            && emit_allocs.is_none()
+            && custom.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "benchmark record must emit at least one metric when ns/op is suppressed",
+            ));
+        }
+
         let sanitized = sanitize_bench_name(self.name);
         let full_name = match self.cpu_procs {
             Some(procs) if procs > 1 => format!("Benchmark{sanitized}-{procs}"),
             _ => format!("Benchmark{sanitized}"),
         };
 
-        write!(out, "{full_name}\t{:8}\t", self.iterations.max(1))?;
-        // Match Go `testing/benchmark.go` `prettyPrint` widths and 4-significant-digit thresholds.
-        let y = self.ns_per_op;
-        if y == 0.0 || y >= 999.95 {
-            write!(out, "{y:10.0} ns/op")?;
-        } else if y >= 99.995 {
-            write!(out, "{y:12.1} ns/op")?;
-        } else if y >= 9.9995 {
-            write!(out, "{y:13.2} ns/op")?;
-        } else if y >= 0.99995 {
-            write!(out, "{y:14.3} ns/op")?;
-        } else if y >= 0.099995 {
-            write!(out, "{y:15.4} ns/op")?;
-        } else if y >= 0.0099995 {
-            write!(out, "{y:16.5} ns/op")?;
-        } else if y >= 0.00099995 {
-            write!(out, "{y:17.6} ns/op")?;
-        } else {
-            write!(out, "{y:18.7} ns/op")?;
+        write!(out, "{full_name}\t{:8}", self.iterations.max(1))?;
+        if let Some(ns) = emit_ns {
+            write!(out, "\t")?;
+            write_pretty_metric(&mut out, ns, "ns/op")?;
         }
-
-        if let Some(mbps) = self.mb_per_sec
-            && mbps.is_finite()
-            && mbps > 0.0
-        {
+        if let Some(mbps) = emit_mbps {
             write!(out, "\t{mbps:8.2} MB/s")?;
         }
-        if let Some(bytes) = self.alloc_bytes_per_op {
+        if let Some(bytes) = emit_bytes {
             write!(out, "\t{bytes:8} B/op")?;
         }
-        if let Some(allocs) = self.allocs_per_op {
+        if let Some(allocs) = emit_allocs {
             write!(out, "\t{allocs:8} allocs/op")?;
+        }
+        for (unit, value) in custom {
+            write!(out, "\t")?;
+            write_pretty_metric(&mut out, value, unit)?;
         }
         writeln!(out)
     }
@@ -746,6 +838,7 @@ pub struct Bencher<'a> {
     alloc_tracker: Option<&'a dyn AllocTracker>,
     start_alloc: AllocSnapshot,
     alloc_delta: AllocSnapshot,
+    extra_metrics: Vec<(String, f64)>,
     profiler: Option<&'a mut dyn Profiler>,
     profiler_running: bool,
     profiler_err: Option<io::Error>,
@@ -775,6 +868,7 @@ impl<'a> Bencher<'a> {
             alloc_tracker,
             start_alloc: AllocSnapshot::default(),
             alloc_delta: AllocSnapshot::default(),
+            extra_metrics: Vec::new(),
             profiler,
             profiler_running: false,
             profiler_err: None,
@@ -784,7 +878,9 @@ impl<'a> Bencher<'a> {
     /// Returns the calibrated target iteration count (`b.N` in Go) for the current epoch.
     ///
     /// Prefer [`Bencher::keep_running`] or [`Bencher::iter`] so setup before the loop stays
-    /// excluded and scoped [`Profiler`] windows are bracketed automatically.
+    /// excluded and scoped [`Profiler`] windows are bracketed automatically. After
+    /// [`Bencher::keep_running`] finishes, `b.iterations()` can be used as the divisor when
+    /// computing per-operation [`Bencher::report_metric`] averages.
     #[must_use]
     pub const fn iterations(&self) -> u64 {
         self.target_n
@@ -798,6 +894,40 @@ impl<'a> Bencher<'a> {
     /// Enables `B/op` and `allocs/op` reporting when the [`Suite`] has an [`AllocTracker`].
     pub fn report_allocs(&mut self) {
         self.report_allocs = true;
+    }
+
+    /// Adds a user-reported `(value, unit)` metric to the benchmark results, matching Go's
+    /// `testing.B.ReportMetric`.
+    ///
+    /// If the metric is accumulated across the loop, divide by `b.iterations() as f64` after
+    /// [`Bencher::keep_running`] finishes, and by convention end per-operation units in `"/op"`
+    /// (for example `"wire-B/op"` or `"cache-misses/op"`). Reporting the same `unit` multiple
+    /// times within a run overrides the previous value. Reporting a built-in unit (`"ns/op"`,
+    /// `"MB/s"`, `"B/op"`, or `"allocs/op"`) overrides that metric, and setting `"ns/op"` or
+    /// `"MB/s"` to `0.0` suppresses it.
+    ///
+    /// An empty `unit`, a `unit` containing whitespace or control characters, or a non-finite
+    /// `value` causes [`Suite::run_to`] to return [`io::ErrorKind::InvalidInput`].
+    pub fn report_metric(&mut self, value: f64, unit: &str) {
+        if let Err(msg) = validate_metric(unit, value) {
+            if self.start_instant.is_some() {
+                self.remaining = 0;
+            }
+            if self.profiler_err.is_none() {
+                self.profiler_err = Some(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("benchmark {:?}: {msg}", self.bench_name),
+                ));
+            }
+            return;
+        }
+        alloc::without_alloc_tracking(|| {
+            if let Some((_, existing)) = self.extra_metrics.iter_mut().find(|(u, _)| u == unit) {
+                *existing = value;
+            } else {
+                self.extra_metrics.push((unit.to_owned(), value));
+            }
+        });
     }
 
     /// Resets the elapsed timer and allocation baseline before the benchmark loop starts,
@@ -1144,7 +1274,7 @@ fn run_single_epoch<'a>(
     };
 
     loop {
-        let (elapsed, bytes_per_op, report_allocs, alloc_delta) = {
+        let (elapsed, bytes_per_op, report_allocs, alloc_delta, extra_metrics) = {
             let mut bencher = Bencher::new(
                 name,
                 n,
@@ -1193,6 +1323,7 @@ fn run_single_epoch<'a>(
                 bencher.bytes_per_op,
                 bencher.report_allocs,
                 bencher.alloc_delta,
+                std::mem::take(&mut bencher.extra_metrics),
             )
         };
 
@@ -1224,6 +1355,7 @@ fn run_single_epoch<'a>(
                 mb_per_sec,
                 alloc_bytes_per_op,
                 allocs_per_op,
+                extra_metrics,
             });
         }
 
@@ -1528,6 +1660,7 @@ mod tests {
                 mb_per_sec: None,
                 alloc_bytes_per_op: None,
                 allocs_per_op: None,
+                extra_metrics: Vec::new(),
             }
             .write(&mut buf)
             .unwrap();
@@ -1547,6 +1680,7 @@ mod tests {
                 mb_per_sec: None,
                 alloc_bytes_per_op: None,
                 allocs_per_op: None,
+                extra_metrics: Vec::new(),
             }
             .write(Vec::new())
             .is_err()
@@ -1560,6 +1694,7 @@ mod tests {
                 mb_per_sec: None,
                 alloc_bytes_per_op: None,
                 allocs_per_op: None,
+                extra_metrics: Vec::new(),
             }
             .write(Vec::new())
             .is_err()
@@ -1939,6 +2074,119 @@ mod tests {
         );
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("     256 B/op\t       1 allocs/op"), "{text}");
+    }
+
+    #[test]
+    fn report_metric_supports_custom_and_builtin_overrides_without_alloc_noise() {
+        let cfg = BenchConfig {
+            benchtime: BenchTime::Iterations(10),
+            count: 1,
+            cpu_procs: 2,
+            benchmem: true,
+            ..BenchConfig::default()
+        };
+        let mut out = Vec::new();
+        Suite::with_config("pkg", cfg)
+            .with_alloc(&TEST_ALLOC)
+            .bench("Encode/codec=zstd", |b| {
+                b.set_bytes(1024);
+                let mut total_wire = 0usize;
+                while b.keep_running() {
+                    let payload = vec![1u8; 64];
+                    total_wire += payload.len();
+                    // Calling `report_metric` inside `keep_running()` must not add heap allocations
+                    // to `B/op` or `allocs/op`, and later calls overwrite earlier ones.
+                    b.report_metric(999_999.0, "wire-B/op");
+                    b.report_metric(0.12346, "compression-ratio");
+                    black_box(payload);
+                }
+                b.report_metric((total_wire as f64) / (b.iterations() as f64), "wire-B/op");
+            })
+            .bench("BuiltinOverrides", |b| {
+                b.set_bytes(1024);
+                b.iter(|| 1);
+                // Override built-in `ns/op` (suppressing it with `0.0`), `MB/s` (suppressing with
+                // `0.0`), `B/op`, and `allocs/op`, while reporting a custom unit.
+                b.report_metric(0.0, "ns/op");
+                b.report_metric(0.0, "MB/s");
+                b.report_metric(512.0, "B/op");
+                b.report_metric(4.0, "allocs/op");
+                b.report_metric(-0.0, "z-custom/op");
+                b.report_metric(12.346, "a-custom/op");
+            })
+            .run_to(&mut out)
+            .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        // Custom metrics are sorted lexicographically by unit (`compression-ratio` before
+        // `wire-B/op`) and formatted with Go's 4-sig-fig `prettyPrint` widths.
+        assert!(
+            text.contains(
+                "      64 B/op\t       1 allocs/op\t         0.1235 compression-ratio\t        64.00 wire-B/op\n"
+            ),
+            "{text}"
+        );
+        // Built-in `ns/op` and `MB/s` were suppressed with `0.0`, `B/op` and `allocs/op` were
+        // overridden, and `-0.0` was normalized to `0`.
+        assert!(
+            text.contains(
+                "BenchmarkBuiltinOverrides-2\t      10\t     512 B/op\t       4 allocs/op\t        12.35 a-custom/op\t         0 z-custom/op\n"
+            ),
+            "{text}"
+        );
+
+        // Invalid units (empty, whitespace, control characters) and invalid values (`NaN`, `inf`,
+        // negative built-in overrides) fail with `InvalidInput`.
+        for (unit, val) in [
+            ("", 1.0),
+            ("wire B/op", 1.0),
+            ("wire\tB/op", 1.0),
+            ("wire\nB/op", 1.0),
+            ("wire-B/op", f64::NAN),
+            ("wire-B/op", f64::INFINITY),
+            ("ns/op", -1.0),
+            ("MB/s", -1.0),
+            ("B/op", -1.0),
+            ("allocs/op", -1.0),
+        ] {
+            let err = Suite::with_config(
+                "pkg",
+                BenchConfig {
+                    benchtime: BenchTime::Iterations(5),
+                    ..BenchConfig::default()
+                },
+            )
+            .bench("InvalidMetric", |b| {
+                while b.keep_running() {
+                    b.report_metric(val, unit);
+                }
+            })
+            .run_to(Vec::new())
+            .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "expected InvalidInput for ({unit:?}, {val})"
+            );
+        }
+
+        // Suppressing `ns/op` with `0.0` when no other metrics are emitted is rejected so an empty
+        // measurement line cannot be produced.
+        let empty_line_err = Suite::with_config(
+            "pkg",
+            BenchConfig {
+                benchtime: BenchTime::Iterations(1),
+                benchmem: false,
+                ..BenchConfig::default()
+            },
+        )
+        .bench("NoMetricsLeft", |b| {
+            b.iter(|| 1);
+            b.report_metric(0.0, "ns/op");
+        })
+        .run_to(Vec::new())
+        .unwrap_err();
+        assert_eq!(empty_line_err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[cfg(not(feature = "pprof"))]

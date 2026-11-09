@@ -113,6 +113,7 @@ fn process_alloc_counts_worker_thread_allocations_across_suite() {
             black_box(unmeasured.len());
             while b.keep_running() {
                 assert_eq!(pool.run_once(4096), 4096);
+                b.report_metric(4096.0, "worker-B/op");
             }
         })
         .run_to(&mut out)
@@ -126,7 +127,10 @@ fn process_alloc_counts_worker_thread_allocations_across_suite() {
         text.contains("BenchmarkWorkerAlloc/size=4kb-2\t      25\t"),
         "{text}"
     );
-    assert!(text.contains("    4096 B/op\t       1 allocs/op"), "{text}");
+    assert!(
+        text.contains("    4096 B/op\t       1 allocs/op\t      4096 worker-B/op"),
+        "{text}"
+    );
     assert!(text.ends_with("PASS\n"), "{text}");
 
     #[cfg(feature = "pprof")]

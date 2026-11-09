@@ -153,6 +153,7 @@ pub fn convert_criterion_dir(
                 mb_per_sec,
                 alloc_bytes_per_op: None,
                 allocs_per_op: None,
+                extra_metrics: Vec::new(),
             };
             rec.write(&mut out)?;
             emitted += 1;
@@ -235,6 +236,7 @@ pub fn convert_libtest_output(
             mb_per_sec,
             alloc_bytes_per_op: None,
             allocs_per_op: None,
+            extra_metrics: Vec::new(),
         };
         rec.write(&mut out)?;
         emitted += 1;
